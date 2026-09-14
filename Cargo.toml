@@ -27,6 +27,7 @@ lopdf = "0.34"
 rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 dirs = "6"
+tempfile = "3"
 ureq = "2.12"
 anyhow = "1"
 thiserror = "2"

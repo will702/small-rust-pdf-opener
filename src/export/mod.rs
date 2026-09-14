@@ -8,9 +8,9 @@ use std::path::Path;
 #[cfg(feature = "anydoc-export")]
 use std::path::PathBuf;
 
-use crate::error::Result;
 #[cfg(feature = "anydoc-export")]
 use crate::error::AppError;
+use crate::error::Result;
 use crate::pdf::DocumentSession;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +58,7 @@ pub fn format_markdown(title: &str, pages: &[PageText]) -> String {
 
 pub fn write_markdown(title: &str, pages: &[PageText], path: &Path) -> Result<()> {
     let content = format_markdown(title, pages);
-    std::fs::write(path, content)?;
+    crate::pdf::atomic_write(path, content.as_bytes())?;
     Ok(())
 }
 
@@ -81,7 +81,7 @@ pub fn write_markdown_anydoc(title: &str, pdf_path: &Path, out: &Path) -> Result
     match markdown_via_anydoc(pdf_path) {
         Ok(body) => {
             let content = ensure_title_heading(title, &body);
-            std::fs::write(out, content)?;
+            crate::pdf::atomic_write(out, content.as_bytes())?;
             Ok(())
         }
         Err(anydoc_err) => {
@@ -124,8 +124,7 @@ pub fn pdf_for_page_selection(
     pages: &[usize],
     page_count: usize,
 ) -> Result<(PathBuf, bool)> {
-    let all_selected = pages.len() == page_count
-        && pages.iter().enumerate().all(|(i, &p)| p == i);
+    let all_selected = pages.len() == page_count && pages.iter().enumerate().all(|(i, &p)| p == i);
     if all_selected {
         return Ok((src.to_path_buf(), false));
     }
@@ -142,9 +141,7 @@ pub fn write_docx(title: &str, pages: &[PageText], path: &Path) -> Result<()> {
     use docx_rs::*;
 
     let mut children: Vec<Paragraph> = Vec::new();
-    children.push(
-        Paragraph::new().add_run(Run::new().add_text(title).bold().size(32)),
-    );
+    children.push(Paragraph::new().add_run(Run::new().add_text(title).bold().size(32)));
 
     for (i, page) in pages.iter().enumerate() {
         if i > 0 {
@@ -172,10 +169,11 @@ pub fn write_docx(title: &str, pages: &[PageText], path: &Path) -> Result<()> {
     for p in children {
         doc = doc.add_paragraph(p);
     }
-    let file = std::fs::File::create(path)?;
-    doc.build().pack(file).map_err(|e| {
-        crate::error::AppError::msg(format!("failed to write docx: {e}"))
-    })?;
+    let mut output = std::io::Cursor::new(Vec::new());
+    doc.build()
+        .pack(&mut output)
+        .map_err(|e| crate::error::AppError::msg(format!("failed to write docx: {e}")))?;
+    crate::pdf::atomic_write(path, &output.into_inner())?;
     Ok(())
 }
 
@@ -207,10 +205,8 @@ mod tests {
 
     #[test]
     fn write_docx_produces_valid_zip_with_document_xml() {
-        let dir = std::env::temp_dir().join(format!(
-            "pdf-opener-export-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("pdf-opener-export-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.docx");
@@ -250,10 +246,7 @@ mod tests {
         let pages = collect_page_texts(&session, &[0]).unwrap();
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].page_1based, 1);
-        let dir = std::env::temp_dir().join(format!(
-            "pdf-opener-md-smoke-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("pdf-opener-md-smoke-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("hello.md");

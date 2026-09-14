@@ -1,4 +1,7 @@
 //! Main egui application.
+mod editor;
+mod workspace;
+use workspace::PendingAction;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -27,6 +30,12 @@ const PAGE_GAP: f32 = 16.0;
 const TEXTURE_CACHE_RADIUS: isize = 2;
 
 enum PageInteraction {
+    SelectEnd {
+        page: usize,
+        start: egui::Pos2,
+        end: egui::Pos2,
+        rect: egui::Rect,
+    },
     CropEnd {
         page: usize,
         start: egui::Pos2,
@@ -49,6 +58,13 @@ enum PageInteraction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolMode {
     View,
+    Draw,
+    Redact,
+    EditText,
+    Forms,
+    Highlight,
+    Note,
+    TextBox,
     Crop,
     VisualSign,
     CertSign,
@@ -65,6 +81,8 @@ struct OcrOverlayLine {
 }
 
 enum BackgroundMsg {
+    SearchDone(Result<Vec<(usize, PdfRect)>, String>),
+    FileDone(Result<String, String>),
     OcrProgress(String),
     OcrPageDone {
         page: usize,
@@ -87,6 +105,26 @@ pub struct PdfApp {
     mode: ToolMode,
     search_query: String,
     search_hits: Vec<PdfRect>,
+    document_hits: Vec<(usize, PdfRect)>,
+    hit_index: usize,
+    show_search: bool,
+    show_pages: bool,
+    show_outline: bool,
+    outline: Vec<(String, usize, usize)>,
+    fit_page: bool,
+    thumbnails: HashMap<usize, egui::TextureHandle>,
+    selected_pages: std::collections::BTreeSet<usize>,
+    recent: Vec<PathBuf>,
+    pending: Option<PendingAction>,
+    allow_close: bool,
+    annotation_text: String,
+    edit_target: Option<(usize, PdfRect)>,
+    edit_size: f32,
+    form_fields: Vec<pdf::FormField>,
+    form_page: Option<usize>,
+    ink_points: Vec<mupdf::Point>,
+    selection: Option<(usize, PdfRect)>,
+
     status: String,
     error: Option<String>,
     show_compress: bool,
@@ -119,6 +157,8 @@ pub struct PdfApp {
     sig_pad: SignaturePad,
     placing_sig: bool,
     imported_sig: Option<(u32, u32, Vec<u8>)>,
+    staged_sig: Option<(usize, PdfRect)>,
+    sig_texture: Option<egui::TextureHandle>,
     // Cert sign
     cert_identity: Option<CertIdentity>,
     cert_password: String,
@@ -144,6 +184,26 @@ impl Default for PdfApp {
             mode: ToolMode::View,
             search_query: String::new(),
             search_hits: Vec::new(),
+            document_hits: Vec::new(),
+            hit_index: 0,
+            show_search: false,
+            show_pages: true,
+            show_outline: false,
+            outline: Vec::new(),
+            fit_page: false,
+            thumbnails: HashMap::new(),
+            selected_pages: Default::default(),
+            recent: Vec::new(),
+            pending: None,
+            allow_close: false,
+            annotation_text: String::new(),
+            selection: None,
+            edit_target: None,
+            edit_size: 12.0,
+            form_fields: Vec::new(),
+            form_page: None,
+            ink_points: Vec::new(),
+
             status: "Open a PDF to begin".into(),
             error: None,
             show_compress: false,
@@ -172,6 +232,8 @@ impl Default for PdfApp {
             sig_pad: SignaturePad::new(400, 150),
             placing_sig: false,
             imported_sig: None,
+            staged_sig: None,
+            sig_texture: None,
             cert_identity: None,
             cert_password: String::new(),
             cert_path: None,
@@ -189,7 +251,12 @@ impl Default for PdfApp {
 impl PdfApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        cc.egui_ctx.all_styles_mut(|style| {
+            style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+            style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        });
         let mut app = Self::default();
+        app.recent = workspace::load_recent();
         if let Some(path) = initial {
             app.open_path(path);
         }
@@ -197,10 +264,44 @@ impl PdfApp {
     }
 
     fn open_path(&mut self, path: PathBuf) {
+        self.request_action(PendingAction::Open(path));
+    }
+
+    fn load_path(&mut self, path: PathBuf) {
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("docx"))
+        {
+            self.error = Some("DOCX editing is unavailable: the macOS office engine failed its document-loading test. Your file has not been changed.".into());
+            return;
+        }
         match DocumentSession::open(&path) {
             Ok(session) => {
+                self.cancel_ocr();
+                let (tx, rx) = mpsc::channel();
+                self.bg_tx = tx;
+                self.bg_rx = rx;
+                self.busy = false;
+                self.ocr_cancel = None;
+                self.document_hits.clear();
+                self.selection = None;
+                self.selected_pages.clear();
+                self.thumbnails.clear();
+                self.mode = ToolMode::View;
+                self.crop_start = None;
+                self.crop_end = None;
+                self.crop_page = None;
+                self.placing_sig = false;
+                self.placing_cert = false;
+                self.staged_sig = None;
+                self.sig_texture = None;
+                self.recent.retain(|p| p != &path);
+                self.recent.insert(0, path.clone());
+                self.recent.truncate(8);
+                workspace::save_recent(&self.recent);
                 self.status = format!("Opened {}", path.display());
                 self.page = 0;
+                self.outline = session.outlines().unwrap_or_default();
                 self.session = Some(session);
                 self.ocr_overlays.clear();
                 self.invalidate_textures();
@@ -253,6 +354,7 @@ impl PdfApp {
 
     fn invalidate_textures(&mut self) {
         self.page_textures.clear();
+        self.thumbnails.clear();
         self.texture_zoom = 0.0;
     }
 
@@ -262,7 +364,9 @@ impl PdfApp {
         };
         if self.fit_width {
             // Use first page (or current) width for fit-width zoom.
-            let page = self.page.min(session.page_count().unwrap_or(1).saturating_sub(1));
+            let page = self
+                .page
+                .min(session.page_count().unwrap_or(1).saturating_sub(1));
             if let Ok((pw, _)) = session.page_size(page) {
                 if pw > 0.0 {
                     let zoom = (available_width / pw).clamp(0.25, 4.0);
@@ -330,7 +434,12 @@ impl PdfApp {
         let page = page.min(count - 1);
         self.page = page;
         self.scroll_to_page = Some(page);
-        self.search_hits.clear();
+        self.search_hits = self
+            .document_hits
+            .iter()
+            .filter(|(p, _)| *p == page)
+            .map(|(_, r)| *r)
+            .collect();
     }
 
     fn page_count(&self) -> usize {
@@ -343,6 +452,25 @@ impl PdfApp {
     fn poll_background(&mut self) {
         while let Ok(msg) = self.bg_rx.try_recv() {
             match msg {
+                BackgroundMsg::FileDone(result) => {
+                    self.busy = false;
+                    match result {
+                        Ok(message) => self.status = message,
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+                BackgroundMsg::SearchDone(result) => {
+                    self.busy = false;
+                    match result {
+                        Ok(hits) => {
+                            self.document_hits = hits;
+                            self.hit_index = 0;
+                            self.focus_hit();
+                        }
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+
                 BackgroundMsg::OcrProgress(s) => self.status = s,
                 BackgroundMsg::OcrModelsDone(res) => {
                     self.busy = false;
@@ -366,12 +494,9 @@ impl PdfApp {
                     self.ocr_cancel = None;
                     self.show_ocr_overlays = true;
                     if cancelled {
-                        self.status = format!(
-                            "OCR cancelled — {ok} page(s) done, {failed} failed"
-                        );
+                        self.status = format!("OCR cancelled — {ok} page(s) done, {failed} failed");
                     } else if failed > 0 {
-                        self.status =
-                            format!("OCR finished — {ok} ok, {failed} failed");
+                        self.status = format!("OCR finished — {ok} ok, {failed} failed");
                     } else {
                         self.status = format!("OCR finished — {ok} page(s)");
                     }
@@ -389,7 +514,7 @@ impl PdfApp {
         let Some(session) = self.session.as_mut() else {
             return;
         };
-        let Ok((_, page_h)) = session.page_size(page) else {
+        let Ok((_, _page_h)) = session.page_size(page) else {
             return;
         };
         let overlays: Vec<OcrOverlayLine> = lines
@@ -406,19 +531,17 @@ impl PdfApp {
             .into_iter()
             .map(|l| {
                 let pdf_x = l.x;
-                let pdf_y = page_h - l.y;
+                let pdf_y = l.y;
                 let fontsize = l.height.clamp(6.0, 36.0);
                 (l.text, pdf_x, pdf_y, fontsize)
             })
             .collect();
         match session.add_ocr_text(page, &mapped) {
             Ok(()) => {
+                self.document_hits.clear();
+                self.search_hits.clear();
                 self.ocr_overlays.insert(page, overlays);
-                self.status = format!(
-                    "OCR added {} text lines on page {}",
-                    mapped.len(),
-                    page + 1
-                );
+                self.status = format!("OCR added {} text lines on page {}", mapped.len(), page + 1);
                 self.invalidate_textures();
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -478,7 +601,8 @@ impl PdfApp {
                 )));
                 let result = (|| {
                     let rendered = session.render_page(page, zoom)?;
-                    let lines = ocr::recognize_rgba(rendered.width, rendered.height, &rendered.rgba)?;
+                    let lines =
+                        ocr::recognize_rgba(rendered.width, rendered.height, &rendered.rgba)?;
                     Ok::<_, AppError>(
                         lines
                             .into_iter()
@@ -497,7 +621,10 @@ impl PdfApp {
                     Ok(_) => ok += 1,
                     Err(_) => failed += 1,
                 }
-                let _ = tx.send(BackgroundMsg::OcrPageDone { page, lines: result });
+                let _ = tx.send(BackgroundMsg::OcrPageDone {
+                    page,
+                    lines: result,
+                });
             }
             let _ = tx.send(BackgroundMsg::OcrJobFinished {
                 ok,
@@ -551,196 +678,18 @@ impl PdfApp {
         });
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Open").clicked() {
-                self.open_dialog();
-            }
-            if ui
-                .add_enabled(self.session.is_some(), egui::Button::new("Save"))
-                .clicked()
-            {
-                self.save();
-            }
-            if ui
-                .add_enabled(self.session.is_some(), egui::Button::new("Save As"))
-                .clicked()
-            {
-                self.save_as();
-            }
-            ui.separator();
-            let count = self.page_count();
-            if ui
-                .add_enabled(self.page > 0, egui::Button::new("◀"))
-                .clicked()
-            {
-                self.go_to_page(self.page.saturating_sub(1));
-            }
-            ui.label(format!("{} / {}", if count == 0 { 0 } else { self.page + 1 }, count));
-            if ui
-                .add_enabled(self.page + 1 < count, egui::Button::new("▶"))
-                .clicked()
-            {
-                self.go_to_page(self.page + 1);
-            }
-            ui.separator();
-            if ui
-                .selectable_label(self.fit_width, "Fit width")
-                .clicked()
-            {
-                self.fit_width = !self.fit_width;
-                self.invalidate_textures();
-            }
-            if ui.button("−").clicked() {
-                self.fit_width = false;
-                self.zoom = (self.zoom / 1.15).max(0.25);
-                self.invalidate_textures();
-            }
-            ui.label(format!("{:.0}%", self.zoom * 100.0));
-            if ui.button("+").clicked() {
-                self.fit_width = false;
-                self.zoom = (self.zoom * 1.15).min(4.0);
-                self.invalidate_textures();
-            }
-            ui.separator();
-            ui.label("Search");
-            let resp = ui.text_edit_singleline(&mut self.search_query);
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                self.run_search();
-            }
-            if ui.button("Find").clicked() {
-                self.run_search();
-            }
-        });
-
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Edit:");
-            if ui
-                .add_enabled(self.session.is_some(), egui::Button::new("Delete page"))
-                .clicked()
-            {
-                if let Some(s) = self.session.as_mut() {
-                    match s.delete_page(self.page) {
-                        Ok(()) => {
-                            self.page = self.page.min(s.page_count().unwrap_or(1).saturating_sub(1));
-                            self.invalidate_textures();
-                            self.status = "Page deleted".into();
-                        }
-                        Err(e) => self.error = Some(e.to_string()),
-                    }
-                }
-            }
-            if ui
-                .add_enabled(self.session.is_some(), egui::Button::new("Rotate ⟳"))
-                .clicked()
-            {
-                if let Some(s) = self.session.as_mut() {
-                    if let Err(e) = s.rotate_page(self.page, 90) {
-                        self.error = Some(e.to_string());
-                    } else {
-                        self.invalidate_textures();
-                        self.status = "Rotated".into();
-                    }
-                }
-            }
-            if ui
-                .add_enabled(
-                    self.session.is_some() && self.page > 0,
-                    egui::Button::new("Move up"),
-                )
-                .clicked()
-            {
-                if let Some(s) = self.session.as_mut() {
-                    let from = self.page;
-                    if let Err(e) = s.move_page(from, from - 1) {
-                        self.error = Some(e.to_string());
-                    } else {
-                        self.invalidate_textures();
-                        self.go_to_page(from - 1);
-                    }
-                }
-            }
-            if ui
-                .add_enabled(
-                    self.session.is_some() && self.page + 1 < self.page_count(),
-                    egui::Button::new("Move down"),
-                )
-                .clicked()
-            {
-                if let Some(s) = self.session.as_mut() {
-                    let from = self.page;
-                    if let Err(e) = s.move_page(from, from + 1) {
-                        self.error = Some(e.to_string());
-                    } else {
-                        self.invalidate_textures();
-                        self.go_to_page(from + 1);
-                    }
-                }
-            }
-            ui.separator();
-            ui.selectable_value(&mut self.mode, ToolMode::View, "View");
-            ui.selectable_value(&mut self.mode, ToolMode::Crop, "Crop");
-            ui.selectable_value(&mut self.mode, ToolMode::VisualSign, "Sign");
-            ui.selectable_value(&mut self.mode, ToolMode::CertSign, "Cert sign");
-            if ui.button("Compress…").clicked() {
-                self.show_compress = true;
-            }
-            if ui.button("Merge…").clicked() {
-                self.show_merge = true;
-            }
-            if ui
-                .add_enabled(self.session.is_some() && !self.busy, egui::Button::new("Append PDF…"))
-                .clicked()
-            {
-                self.append_pdfs_dialog();
-            }
-            if ui
-                .add_enabled(self.session.is_some(), egui::Button::new("Split…"))
-                .clicked()
-            {
-                self.show_split = true;
-            }
-            if ui
-                .add_enabled(self.session.is_some(), egui::Button::new("Extract…"))
-                .clicked()
-            {
-                self.show_extract = true;
-            }
-            if ui
-                .add_enabled(self.session.is_some(), egui::Button::new("Export…"))
-                .clicked()
-            {
-                self.show_export = true;
-            }
-            if ui.button("OCR…").clicked() {
-                self.show_ocr = true;
-            }
-        });
-    }
-
-    fn run_search(&mut self) {
-        self.search_hits.clear();
-        let Some(session) = self.session.as_ref() else {
-            return;
-        };
-        match session.search(self.page, &self.search_query) {
-            Ok(hits) => {
-                self.status = format!("{} hits on this page", hits.len());
-                self.search_hits = hits;
-            }
-            Err(e) => self.error = Some(e.to_string()),
-        }
-    }
-
     fn side_panels(&mut self, ui: &mut egui::Ui) {
+        if self.busy {
+            return;
+        }
         if self.mode == ToolMode::VisualSign {
             egui::Panel::right("sign_panel")
                 .default_size(320.0)
                 .show(ui, |ui| {
                     ui.heading("Visual signature");
-                    ui.label("Draw below, then click Place on page.");
+                    ui.label("Draw or import, place a preview, then apply.");
                     let (resp, painter) = ui.allocate_painter(
-                        egui::vec2(self.sig_pad.pad_w as f32, self.sig_pad.pad_h as f32),
+                        egui::vec2(ui.available_width().min(400.0), 150.0),
                         egui::Sense::click_and_drag(),
                     );
                     painter.rect_filled(resp.rect, 4.0, egui::Color32::from_gray(245));
@@ -751,8 +700,14 @@ impl PdfApp {
                         egui::StrokeKind::Outside,
                     );
                     if let Some(pos) = resp.interact_pointer_pos() {
-                        let local = pos - resp.rect.min;
+                        let local = (pos - resp.rect.min)
+                            * egui::vec2(
+                                self.sig_pad.pad_w as f32 / resp.rect.width(),
+                                self.sig_pad.pad_h as f32 / resp.rect.height(),
+                            );
                         if resp.drag_started() {
+                            self.staged_sig = None;
+                            self.sig_texture = None;
                             self.sig_pad.begin(local.x, local.y);
                         } else if resp.dragged() {
                             self.sig_pad.drag(local.x, local.y);
@@ -764,8 +719,20 @@ impl PdfApp {
                         for pair in stroke.windows(2) {
                             painter.line_segment(
                                 [
-                                    resp.rect.min + egui::vec2(pair[0].0, pair[0].1),
-                                    resp.rect.min + egui::vec2(pair[1].0, pair[1].1),
+                                    resp.rect.min
+                                        + egui::vec2(
+                                            pair[0].0 * resp.rect.width()
+                                                / self.sig_pad.pad_w as f32,
+                                            pair[0].1 * resp.rect.height()
+                                                / self.sig_pad.pad_h as f32,
+                                        ),
+                                    resp.rect.min
+                                        + egui::vec2(
+                                            pair[1].0 * resp.rect.width()
+                                                / self.sig_pad.pad_w as f32,
+                                            pair[1].1 * resp.rect.height()
+                                                / self.sig_pad.pad_h as f32,
+                                        ),
                                 ],
                                 egui::Stroke::new(2.0, egui::Color32::from_rgb(20, 20, 40)),
                             );
@@ -775,6 +742,8 @@ impl PdfApp {
                         if ui.button("Clear").clicked() {
                             self.sig_pad.clear();
                             self.imported_sig = None;
+                            self.sig_texture = None;
+                            self.staged_sig = None;
                         }
                         if ui.button("Import PNG…").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
@@ -799,10 +768,64 @@ impl PdfApp {
                             )
                             .clicked()
                         {
+                            let (w, h, rgba) = self
+                                .imported_sig
+                                .clone()
+                                .unwrap_or_else(|| self.sig_pad.to_rgba());
+                            self.sig_texture = Some(ui.ctx().load_texture(
+                                "signature-preview",
+                                egui::ColorImage::from_rgba_unmultiplied(
+                                    [w as usize, h as usize],
+                                    &rgba,
+                                ),
+                                egui::TextureOptions::LINEAR,
+                            ));
                             self.placing_sig = true;
                             self.status = "Click on the page to place signature".into();
                         }
                     });
+                    if let Some((page, mut area)) = self.staged_sig {
+                        ui.separator();
+                        ui.label("Signature preview (points)");
+                        let mut w = area.width();
+                        let mut h = area.height();
+                        ui.horizontal(|ui| {
+                            ui.label("X");
+                            ui.add(egui::DragValue::new(&mut area.x0));
+                            ui.label("Y");
+                            ui.add(egui::DragValue::new(&mut area.y0));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Width");
+                            ui.add(egui::DragValue::new(&mut w).range(2.0..=1000.0));
+                            ui.label("Height");
+                            ui.add(egui::DragValue::new(&mut h).range(2.0..=1000.0));
+                        });
+                        area.x1 = area.x0 + w;
+                        area.y1 = area.y0 + h;
+                        self.staged_sig = Some((page, area));
+                        ui.label("Click elsewhere on the page to move the preview.");
+                        if ui.button("Apply signature").clicked() {
+                            let (w, h, rgba) = self
+                                .imported_sig
+                                .clone()
+                                .unwrap_or_else(|| self.sig_pad.to_rgba());
+                            if let Some(s) = self.session.as_mut() {
+                                match s.stamp_image(page, &rgba, w, h, area) {
+                                    Ok(()) => {
+                                        self.content_changed("Signature applied");
+                                        self.staged_sig = None;
+                                        self.placing_sig = false;
+                                    }
+                                    Err(e) => self.error = Some(e.to_string()),
+                                }
+                            }
+                        }
+                        if ui.button("Cancel placement").clicked() {
+                            self.staged_sig = None;
+                            self.placing_sig = false;
+                        }
+                    }
                 });
         }
 
@@ -825,9 +848,7 @@ impl PdfApp {
                     }
                     ui.horizontal(|ui| {
                         ui.label("Password");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.cert_password).password(true),
-                        );
+                        ui.add(egui::TextEdit::singleline(&mut self.cert_password).password(true));
                     });
                     if ui.button("Load certificate").clicked() {
                         if let Some(path) = self.cert_path.clone() {
@@ -835,6 +856,7 @@ impl PdfApp {
                                 Ok(id) => {
                                     self.status = format!("Loaded: {}", id.subject);
                                     self.cert_identity = Some(id);
+                                    self.cert_password.clear();
                                 }
                                 Err(e) => self.error = Some(e.to_string()),
                             }
@@ -879,7 +901,7 @@ impl PdfApp {
                             self.show_compress = false;
                         }
                         if ui
-                            .add_enabled(self.session.is_some(), egui::Button::new("Compress & Save"))
+                            .add_enabled(self.session.is_some() && !self.busy, egui::Button::new("Compress & Save"))
                             .clicked()
                         {
                             if let Some(path) = rfd::FileDialog::new()
@@ -887,12 +909,18 @@ impl PdfApp {
                                 .set_file_name("compressed.pdf")
                                 .save_file()
                             {
-                                if let Some(s) = self.session.as_mut() {
-                                    match s.compress_save(&path, self.compress_preset) {
-                                        Ok(()) => {
-                                            self.status =
-                                                format!("Compressed → {}", path.display());
+                                if let Some(s) = self.session.as_ref() {
+                                    match s.write_bytes(CompressPreset::Fast.write_options()) {
+                                        Ok(bytes) => {
+                                            let preset = self.compress_preset;
                                             self.show_compress = false;
+                                            self.run_file_job("Compressing…",move || {
+                                                let before = bytes.len();
+                                                let mut s = DocumentSession::from_bytes(&bytes)?;
+                                                s.compress_save(&path,preset)?;
+                                                let after = std::fs::metadata(&path)?.len();
+                                                Ok(format!("Compression: {:.1} KB → {:.1} KB ({:+.1}%) · {}",before as f64/1024.0,after as f64/1024.0,(after as f64/before as f64-1.0)*100.0,path.display()))
+                                            });
                                         }
                                         Err(e) => self.error = Some(e.to_string()),
                                     }
@@ -1138,7 +1166,7 @@ impl PdfApp {
                     } else {
                         ui.label("Export embedded PDF text to Markdown or Word.");
                     }
-                    ui.label("For scanned pages, run OCR… first.");
+                    ui.label("Text export does not preserve the original layout, images, or tables. For scanned pages, run OCR first.");
                     ui.horizontal(|ui| {
                         ui.label("Format");
                         ui.selectable_value(
@@ -1197,13 +1225,39 @@ impl PdfApp {
     fn viewer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if self.session.is_none() {
             ui.centered_and_justified(|ui| {
-                ui.label("Open a PDF file to view it.");
+                ui.vertical_centered(|ui| {
+                    ui.add_space(100.0);
+                    ui.heading("Your documents. Your workspace.");
+                    ui.label("Read, organize, annotate, and sign — all on your device.");
+                    ui.add_space(16.0);
+                    if ui.button("Open PDF…").clicked() {
+                        self.open_dialog();
+                    }
+                    ui.weak("or drop a PDF into this window");
+                    ui.add_space(24.0);
+                    for path in self.recent.clone() {
+                        if ui
+                            .button(path.file_name().unwrap_or_default().to_string_lossy())
+                            .on_hover_text(path.display().to_string())
+                            .clicked()
+                        {
+                            self.open_path(path);
+                        }
+                    }
+                });
             });
             return;
         }
 
         let avail_w = ui.available_width() - 24.0;
         self.update_zoom(avail_w.max(100.0));
+        if self.fit_page {
+            if let Some(Ok((w, h))) = self.session.as_ref().map(|s| s.page_size(self.page)) {
+                self.zoom = (avail_w / w)
+                    .min((ui.available_height() - 24.0) / h)
+                    .clamp(0.1, 4.0);
+            }
+        }
 
         let count = self.page_count();
         let zoom = self.zoom;
@@ -1223,7 +1277,7 @@ impl PdfApp {
         let mut best_overlap = 0.0f32;
         let mut interaction: Option<PageInteraction> = None;
 
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .id_salt("pdf_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1236,13 +1290,10 @@ impl PdfApp {
                         let pad = ((ui.available_width() - size.x) * 0.5).max(0.0);
                         ui.add_space(pad);
 
-                        let sense = if matches!(
-                            mode,
-                            ToolMode::Crop | ToolMode::VisualSign | ToolMode::CertSign
-                        ) {
-                            egui::Sense::click_and_drag()
-                        } else {
+                        let sense = if self.busy {
                             egui::Sense::hover()
+                        } else {
+                            egui::Sense::click_and_drag()
                         };
 
                         let (response, painter) = ui.allocate_painter(size, sense);
@@ -1286,8 +1337,10 @@ impl PdfApp {
                             egui::StrokeKind::Outside,
                         );
 
-                        if page_idx == self.page {
-                            for hit in &self.search_hits {
+                        if self.show_search {
+                            for (_, hit) in
+                                self.document_hits.iter().filter(|(p, _)| *p == page_idx)
+                            {
                                 let r = pdf_rect_to_screen(hit, zoom, rect);
                                 painter.rect_filled(
                                     r,
@@ -1297,6 +1350,25 @@ impl PdfApp {
                             }
                         }
 
+                        if let (Some((p, area)), Some(tex)) = (self.staged_sig, &self.sig_texture) {
+                            if p == page_idx {
+                                painter.image(
+                                    tex.id(),
+                                    pdf_rect_to_screen(&area, zoom, rect),
+                                    egui::Rect::from_min_max(
+                                        egui::Pos2::ZERO,
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                                painter.rect_stroke(
+                                    pdf_rect_to_screen(&area, zoom, rect),
+                                    0.0,
+                                    egui::Stroke::new(1.0, egui::Color32::BLUE),
+                                    egui::StrokeKind::Outside,
+                                );
+                            }
+                        }
                         if self.show_ocr_overlays {
                             if let Some(lines) = self.ocr_overlays.get(&page_idx) {
                                 for line in lines {
@@ -1335,9 +1407,63 @@ impl PdfApp {
                             }
                         }
 
+                        if let Some((p, area)) = self.selection {
+                            if p == page_idx {
+                                painter.rect_filled(
+                                    pdf_rect_to_screen(&area, zoom, rect),
+                                    0.0,
+                                    egui::Color32::from_rgba_unmultiplied(50, 130, 230, 45),
+                                );
+                            }
+                        }
                         // Live drag tracking + deferred commit events.
                         match mode {
-                            ToolMode::Crop => {
+                            ToolMode::Draw => {
+                                if response.drag_started() {
+                                    self.ink_points.clear();
+                                    self.crop_page = Some(page_idx);
+                                }
+                                if self.crop_page == Some(page_idx) {
+                                    if response.dragged() {
+                                        if let Some(pos) = response.interact_pointer_pos() {
+                                            let local =
+                                                (pos.clamp(rect.min, rect.max) - rect.min) / zoom;
+                                            self.ink_points
+                                                .push(mupdf::Point::new(local.x, local.y));
+                                        }
+                                    }
+                                    for pair in self.ink_points.windows(2) {
+                                        painter.line_segment(
+                                            [
+                                                rect.min + egui::vec2(pair[0].x, pair[0].y) * zoom,
+                                                rect.min + egui::vec2(pair[1].x, pair[1].y) * zoom,
+                                            ],
+                                            egui::Stroke::new(
+                                                2.0,
+                                                egui::Color32::from_rgb(30, 90, 180),
+                                            ),
+                                        );
+                                    }
+                                    if response.drag_stopped() {
+                                        if let Some(s) = self.session.as_mut() {
+                                            match s.draw_ink(page_idx, &self.ink_points) {
+                                                Ok(()) => self.content_changed("Drawing added"),
+                                                Err(e) => self.error = Some(e.to_string()),
+                                            }
+                                        }
+                                        self.ink_points.clear();
+                                        self.crop_page = None;
+                                    }
+                                }
+                            }
+
+                            ToolMode::Crop
+                            | ToolMode::View
+                            | ToolMode::Highlight
+                            | ToolMode::Note
+                            | ToolMode::TextBox
+                            | ToolMode::Redact
+                            | ToolMode::EditText => {
                                 if response.drag_started() {
                                     if let Some(pos) = response.interact_pointer_pos() {
                                         self.crop_start = Some(pos);
@@ -1350,14 +1476,22 @@ impl PdfApp {
                                         self.crop_end = response.interact_pointer_pos();
                                     }
                                     if response.drag_stopped() {
-                                        if let (Some(a), Some(b)) =
-                                            (self.crop_start, self.crop_end)
+                                        if let (Some(a), Some(b)) = (self.crop_start, self.crop_end)
                                         {
-                                            interaction = Some(PageInteraction::CropEnd {
-                                                page: page_idx,
-                                                start: a,
-                                                end: b,
-                                                rect,
+                                            interaction = Some(if mode == ToolMode::Crop {
+                                                PageInteraction::CropEnd {
+                                                    page: page_idx,
+                                                    start: a,
+                                                    end: b,
+                                                    rect,
+                                                }
+                                            } else {
+                                                PageInteraction::SelectEnd {
+                                                    page: page_idx,
+                                                    start: a,
+                                                    end: b,
+                                                    rect,
+                                                }
                                             });
                                         }
                                     }
@@ -1442,6 +1576,58 @@ impl PdfApp {
 
     fn apply_page_interaction(&mut self, ev: PageInteraction, zoom: f32) {
         match ev {
+            PageInteraction::SelectEnd {
+                page,
+                start,
+                end,
+                rect,
+            } => {
+                let area = screen_rect_to_pdf(
+                    egui::Rect::from_two_pos(start, end).intersect(rect),
+                    zoom,
+                    rect,
+                    0.0,
+                );
+                if matches!(self.mode, ToolMode::Redact | ToolMode::EditText) {
+                    self.prepare_edit(page, area);
+                    self.crop_start = None;
+                    self.crop_end = None;
+                    self.crop_page = None;
+                    return;
+                }
+                if let Some(s) = self.session.as_mut() {
+                    let result = match self.mode {
+                        ToolMode::View => s.selected_text(page, area).map(|(text, _)| {
+                            self.status = format!(
+                                "Selected {} characters — copy with ⌘/Ctrl+C",
+                                text.chars().count()
+                            );
+                            self.selection = Some((page, area));
+                        }),
+                        mode => s.annotate(
+                            page,
+                            area,
+                            &self.annotation_text,
+                            match mode {
+                                ToolMode::Highlight => 0,
+                                ToolMode::Note => 1,
+                                _ => 2,
+                            },
+                        ),
+                    };
+                    match result {
+                        Ok(()) => {
+                            if self.mode != ToolMode::View {
+                                self.content_changed("Annotation added");
+                            }
+                        }
+                        Err(e) => self.error = Some(e.to_string()),
+                    }
+                }
+                self.crop_start = None;
+                self.crop_end = None;
+                self.crop_page = None;
+            }
             PageInteraction::CropEnd {
                 page,
                 start,
@@ -1450,14 +1636,14 @@ impl PdfApp {
             } => {
                 if let Some(session) = self.session.as_mut() {
                     if let Ok((_, page_h)) = session.page_size(page) {
-                        let screen = egui::Rect::from_two_pos(start, end);
+                        let screen = egui::Rect::from_two_pos(start, end).intersect(rect);
                         let crop = screen_rect_to_pdf(screen, zoom, rect, page_h);
                         if let Err(e) = session.set_crop(page, crop) {
                             self.error = Some(e.to_string());
                         } else {
                             self.page = page;
                             self.status = format!("Crop applied on page {}", page + 1);
-                            self.invalidate_textures();
+                            self.content_changed("Crop applied");
                         }
                     }
                 }
@@ -1467,8 +1653,16 @@ impl PdfApp {
             }
             PageInteraction::SignClick { page, pos, rect } => {
                 self.page = page;
-                self.place_visual_signature(pos, rect, zoom);
-                self.placing_sig = false;
+                let (w, h, _) = self
+                    .imported_sig
+                    .clone()
+                    .unwrap_or_else(|| self.sig_pad.to_rgba());
+                let a = (pos - rect.min) / zoom;
+                let (width, height) = self
+                    .staged_sig
+                    .map(|(_, r)| (r.width(), r.height()))
+                    .unwrap_or((150.0, 150.0 * h as f32 / w as f32));
+                self.staged_sig = Some((page, PdfRect::new(a.x, a.y, a.x + width, a.y + height)));
             }
             PageInteraction::CertEnd {
                 page,
@@ -1482,39 +1676,6 @@ impl PdfApp {
                 self.cert_place = None;
                 self.cert_page = None;
             }
-        }
-    }
-
-    fn place_visual_signature(&mut self, pos: egui::Pos2, page_rect: egui::Rect, zoom: f32) {
-        let (w, h, rgba) = if let Some((w, h, ref rgba)) = self.imported_sig {
-            (w, h, rgba.clone())
-        } else {
-            self.sig_pad.to_rgba()
-        };
-        let Some(session) = self.session.as_mut() else {
-            return;
-        };
-        let Ok((_, page_h)) = session.page_size(self.page) else {
-            return;
-        };
-        let sig_w_pt = (w as f32 / zoom) * 0.5; // display half pad size-ish
-        let sig_h_pt = (h as f32 / zoom) * 0.5;
-        let local = pos - page_rect.min;
-        let pdf_x = local.x / zoom;
-        let pdf_y_top = local.y / zoom;
-        let pdf_y = page_h - pdf_y_top;
-        let rect = PdfRect {
-            x0: pdf_x,
-            y0: pdf_y - sig_h_pt,
-            x1: pdf_x + sig_w_pt,
-            y1: pdf_y,
-        };
-        match session.stamp_image(self.page, &rgba, w, h, rect) {
-            Ok(()) => {
-                self.status = "Signature stamped".into();
-                self.invalidate_textures();
-            }
-            Err(e) => self.error = Some(e.to_string()),
         }
     }
 
@@ -1536,6 +1697,13 @@ impl PdfApp {
         };
         let screen = egui::Rect::from_two_pos(a, b);
         let crop = screen_rect_to_pdf(screen, zoom, page_rect, page_h);
+        let crop = match session.raw_rect(self.page, crop) {
+            Ok(r) => r,
+            Err(e) => {
+                self.error = Some(e.to_string());
+                return;
+            }
+        };
         let rect = [crop.x0, crop.y0, crop.x1, crop.y1];
 
         let bytes = match session.write_bytes(CompressPreset::Balanced.write_options()) {
@@ -1555,14 +1723,14 @@ impl PdfApp {
                     .set_file_name("signed.pdf")
                     .save_file()
                 {
-                    if let Err(e) = std::fs::write(&path, &signed) {
+                    if let Err(e) = pdf::atomic_write(&path, &signed) {
                         self.error = Some(e.to_string());
                         return;
                     }
                     match DocumentSession::open(&path) {
                         Ok(s) => {
-                            self.session = Some(s);
-                            self.invalidate_textures();
+                            drop(s);
+                            self.load_path(path.clone());
                             self.status = format!("Signed → {}", path.display());
                         }
                         Err(e) => {
@@ -1577,12 +1745,17 @@ impl PdfApp {
     }
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        let next = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::PageDown));
-        let prev = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::PageUp));
-        if next && self.page + 1 < self.page_count() {
+        if self.pending.is_some() || self.busy {
+            return;
+        }
+        let next = ctx
+            .input(|i| i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::PageDown));
+        let prev =
+            ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::PageUp));
+        if !ctx.egui_wants_keyboard_input() && next && self.page + 1 < self.page_count() {
             self.go_to_page(self.page + 1);
         }
-        if prev && self.page > 0 {
+        if !ctx.egui_wants_keyboard_input() && prev && self.page > 0 {
             self.go_to_page(self.page.saturating_sub(1));
         }
         let open = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O));
@@ -1628,7 +1801,7 @@ impl PdfApp {
         }
         if appended > 0 {
             self.invalidate_textures();
-            self.status = format!("Appended {appended} PDF(s)");
+            self.content_changed(&format!("Appended {appended} PDF(s)"));
         }
     }
 
@@ -1648,13 +1821,12 @@ impl PdfApp {
         else {
             return;
         };
-        match pdf::merge_files_to_path(&self.merge_paths, &out) {
-            Ok(()) => {
-                self.status = format!("Merged → {}", out.display());
-                self.show_merge = false;
-            }
-            Err(e) => self.error = Some(e.to_string()),
-        }
+        let paths = self.merge_paths.clone();
+        self.show_merge = false;
+        self.run_file_job("Merging PDFs…", move || {
+            pdf::merge_files_to_path(&paths, &out)?;
+            Ok(format!("Merged → {}", out.display()))
+        });
     }
 
     fn run_split(&mut self) {
@@ -1870,7 +2042,9 @@ impl PdfApp {
         page_count: usize,
         out: &std::path::Path,
     ) -> crate::error::Result<()> {
-        let src = self.materialize_session_path().map_err(crate::error::AppError::msg)?;
+        let src = self
+            .materialize_session_path()
+            .map_err(crate::error::AppError::msg)?;
         let (pdf, is_temp) = export::pdf_for_page_selection(&src, pages, page_count)?;
         let result = export::write_markdown_anydoc(title, &pdf, out);
         if is_temp {
@@ -1880,92 +2054,64 @@ impl PdfApp {
     }
 
     /// Path to current document bytes on disk (writes a temp file when dirty / unsaved).
-    fn materialize_session_path(&self) -> Result<PathBuf, String> {
-        let session = self
-            .session
-            .as_ref()
-            .ok_or_else(|| "No document open".to_string())?;
-        if !session.dirty {
-            if let Some(path) = session.path.clone() {
-                return Ok(path);
-            }
-        }
-        let bytes = session
-            .write_bytes(CompressPreset::Balanced.write_options())
-            .map_err(|e| e.to_string())?;
-        let path = std::env::temp_dir().join(format!(
-            "pdf-opener-export-{}.pdf",
-            std::process::id()
-        ));
-        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
-        Ok(path)
+    fn materialize_session_path(&self) -> Result<tempfile::TempPath, String> {
+        use std::io::Write;
+        let session = self.session.as_ref().ok_or_else(|| "No document open".to_string())?;
+        let bytes = session.write_bytes(CompressPreset::Balanced.write_options()).map_err(|e| e.to_string())?;
+        let mut file = tempfile::Builder::new().prefix("pdf-opener-export-").suffix(".pdf").tempfile().map_err(|e| e.to_string())?;
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
+        Ok(file.into_temp_path())
     }
+
 }
 
 impl eframe::App for PdfApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background();
+        self.workspace_events(ctx);
         self.handle_keys(ctx);
         self.dialogs(ctx);
         if self.busy {
-            ctx.request_repaint();
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            self.toolbar(ui);
-            if let Some(s) = &self.session {
-                if s.dirty {
-                    ui.colored_label(egui::Color32::from_rgb(180, 100, 0), "Modified");
-                }
-            }
-            ui.label(&self.status);
-        });
-
+        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
+        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        self.page_sidebar(ui, &ctx);
         self.side_panels(ui);
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            self.viewer(ui, &ctx);
-        });
+        self.editor_panel(ui);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(if ctx.global_style().visuals.dark_mode {
+                        egui::Color32::from_rgb(28, 30, 34)
+                    } else {
+                        egui::Color32::from_rgb(229, 232, 237)
+                    })
+                    .inner_margin(16.0),
+            )
+            .show(ui, |ui| self.viewer(ui, &ctx));
     }
 }
 
 fn pdf_rect_to_screen(r: &PdfRect, zoom: f32, page_rect: egui::Rect) -> egui::Rect {
-    // PDF y grows up; screen y grows down. Approximate using page_rect height.
-    let page_h = page_rect.height() / zoom;
-    let x0 = page_rect.min.x + r.x0 * zoom;
-    let x1 = page_rect.min.x + r.x1 * zoom;
-    let y0 = page_rect.min.y + (page_h - r.y1) * zoom;
-    let y1 = page_rect.min.y + (page_h - r.y0) * zoom;
-    egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
+    egui::Rect::from_min_max(
+        page_rect.min + egui::vec2(r.x0, r.y0) * zoom,
+        page_rect.min + egui::vec2(r.x1, r.y1) * zoom,
+    )
 }
 
 fn screen_rect_to_pdf(
     screen: egui::Rect,
     zoom: f32,
     page_rect: egui::Rect,
-    page_h: f32,
+    _page_h: f32,
 ) -> PdfRect {
-    let local = egui::Rect::from_min_max(
-        egui::pos2(
-            (screen.min.x - page_rect.min.x) / zoom,
-            (screen.min.y - page_rect.min.y) / zoom,
-        ),
-        egui::pos2(
-            (screen.max.x - page_rect.min.x) / zoom,
-            (screen.max.y - page_rect.min.y) / zoom,
-        ),
-    );
-    PdfRect {
-        x0: local.min.x.min(local.max.x),
-        x1: local.min.x.max(local.max.x),
-        y0: page_h - local.max.y.max(local.min.y),
-        y1: page_h - local.min.y.min(local.max.y),
-    }
+    let a = (screen.min - page_rect.min) / zoom;
+    let b = (screen.max - page_rect.min) / zoom;
+    PdfRect::new(a.x, a.y, b.x, b.y)
 }
-
-#[allow(dead_code)]
-fn _unused_error_check(_: AppError) {}
