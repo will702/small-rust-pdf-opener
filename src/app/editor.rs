@@ -27,8 +27,15 @@ impl PdfApp {
         {
             return;
         }
-        egui::Panel::right("editor_properties").default_size(280.0).show(ui, |ui| {
-            ui.add_enabled_ui(!self.busy, |ui| {
+        egui::Panel::right("editor_properties")
+            .default_size(280.0)
+            .frame(
+                crate::theme::chrome_frame(ui)
+                    .inner_margin(egui::Margin::symmetric(12, 12)),
+            )
+            .show(ui, |ui| {
+                crate::theme::hairline_left(ui);
+                ui.add_enabled_ui(!self.busy, |ui| {
                 match self.mode {
                     ToolMode::Forms => {
                         ui.heading("Form fields");
@@ -70,7 +77,7 @@ impl PdfApp {
                         if let Some((page,area)) = self.edit_target {
                             ui.add(egui::TextEdit::multiline(&mut self.annotation_text).desired_rows(10).desired_width(f32::INFINITY));
                             ui.add(egui::DragValue::new(&mut self.edit_size).range(6.0..=96.0).suffix(" pt"));
-                            if ui.button("Replace paragraph").clicked() {
+                            if ui.add(crate::theme::primary_button(ui, "Replace paragraph")).clicked() {
                                 match self.session.as_mut().unwrap().replace_paragraph(page,area,&self.annotation_text,self.edit_size) {
                                     Ok(()) => self.content_changed("Paragraph replaced — Undo is available"), Err(e) => self.error = Some(e.to_string()),
                                 }
@@ -83,7 +90,7 @@ impl PdfApp {
                         ui.label("Creates a new PDF. Text and graphics touching the selection are removed; a touched image is removed entirely. Document metadata and attachments are also removed.");
                         if let Some((page,area)) = self.edit_target {
                             ui.label(format!("Selected area on page {}",page+1));
-                            if ui.button("Save redacted copy…").clicked() {
+                            if ui.add(crate::theme::primary_button(ui, "Save redacted copy…")).clicked() {
                                 if let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name("redacted.pdf").save_file() {
                                     let source = self.session.as_ref().and_then(|s| s.path.as_ref());
                                     if source.is_some_and(|p| p == &path || p.canonicalize().ok().zip(path.canonicalize().ok()).is_some_and(|(a,b)| a==b)) {

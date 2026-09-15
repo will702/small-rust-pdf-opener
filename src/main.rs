@@ -5,6 +5,7 @@ mod ocr;
 mod page_range;
 mod pdf;
 mod sign;
+mod theme;
 
 use std::path::PathBuf;
 use std::sync::Arc;

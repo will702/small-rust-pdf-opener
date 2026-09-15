@@ -21,6 +21,7 @@ anydoc-export = ["dep:anydoc"]
 [dependencies]
 eframe = "0.35"
 egui = "0.35"
+epaint = "0.35"
 egui_extras = { version = "0.35", features = ["file", "image"] }
 mupdf = { version = "0.8", default-features = false, features = ["base14-fonts", "system-fonts"] }
 lopdf = "0.34"

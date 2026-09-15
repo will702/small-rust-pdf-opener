@@ -94,24 +94,29 @@ impl PdfApp {
         }
         if self.pending.is_some() {
             egui::Modal::new(egui::Id::new("unsaved_changes")).show(ctx, |ui| {
+                ui.set_width(320.0);
                 ui.heading("Save your changes?");
                 ui.label("This document has unsaved edits.");
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        self.pending = None;
-                    }
-                    if ui.button("Discard changes").clicked() {
-                        if let Some(action) = self.pending.take() {
-                            self.perform_action(action);
-                        }
-                    }
-                    if ui.button("Save changes").clicked() {
+                ui.add_space(6.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(crate::theme::primary_button(ui, "Save changes"))
+                        .clicked()
+                    {
                         self.save();
                         if self.session.as_ref().is_some_and(|s| !s.dirty) {
                             if let Some(action) = self.pending.take() {
                                 self.perform_action(action);
                             }
                         }
+                    }
+                    if ui.button("Discard changes").clicked() {
+                        if let Some(action) = self.pending.take() {
+                            self.perform_action(action);
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.pending = None;
                     }
                 });
             });
@@ -149,7 +154,18 @@ impl PdfApp {
 
     pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.strong("PDF Opener");
+            if let Some(logo) = &self.logo {
+                ui.add(
+                    egui::Image::new((logo.id(), logo.size_vec2()))
+                        .fit_to_exact_size(egui::vec2(20.0, 20.0))
+                        .corner_radius(4.5),
+                );
+            }
+            ui.label(
+                egui::RichText::new("PDF Opener")
+                    .family(egui::FontFamily::Name(crate::theme::FAMILY_SEMIBOLD.into()))
+                    .size(13.0),
+            );
             ui.separator();
             ui.menu_button("File", |ui| {
                 if ui.button("Open…                 ⌘O").clicked() {
@@ -344,7 +360,7 @@ impl PdfApp {
                         ui.close();
                     }
                 });
-                if ui.button("Save").clicked() {
+                if ui.add(crate::theme::primary_button(ui, "Save")).clicked() {
                     self.save();
                 }
             });
@@ -489,19 +505,22 @@ impl PdfApp {
 
     pub(super) fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
+            let small = |ui: &mut egui::Ui, text: String| {
+                ui.label(egui::RichText::new(text).weak().size(11.0));
+            };
             if self.busy {
                 ui.spinner();
             }
             if self.session.is_some() {
                 let mut number = self.page + 1;
-                ui.label("Page");
+                small(ui, "Page".into());
                 if ui
                     .add(egui::DragValue::new(&mut number).range(1..=self.page_count()))
                     .changed()
                 {
                     self.go_to_page(number - 1);
                 }
-                ui.label(format!("of {}", self.page_count()));
+                small(ui, format!("of {}", self.page_count()));
                 ui.separator();
                 if ui.selectable_label(self.fit_width, "Fit width").clicked() {
                     self.fit_width = true;
@@ -526,7 +545,7 @@ impl PdfApp {
                 }
                 ui.separator();
             }
-            ui.label(&self.status);
+            small(ui, self.status.clone());
         });
     }
 
@@ -537,11 +556,16 @@ impl PdfApp {
         egui::Panel::left("pages")
             .default_size(164.0)
             .size_range(140.0..=260.0)
+            .frame(crate::theme::chrome_frame(ui).inner_margin(egui::Margin::symmetric(10, 10)))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.show_outline, false, "Pages");
-                    ui.selectable_value(&mut self.show_outline, true, "Outline");
-                });
+                crate::theme::hairline_right(ui);
+                if let Some(segment) = crate::theme::segmented_control(
+                    ui,
+                    self.show_outline as usize,
+                    &["Pages", "Outline"],
+                ) {
+                    self.show_outline = segment == 1;
+                }
                 if self.show_outline {
                     if self.outline.is_empty() {
                         ui.weak("No document outline");
@@ -558,7 +582,11 @@ impl PdfApp {
                     });
                     return;
                 }
-                ui.weak("⌘/Ctrl-click to select several");
+                ui.label(
+                    egui::RichText::new("⌘/Ctrl-click to select several")
+                        .weak()
+                        .size(11.0),
+                );
                 egui::ScrollArea::vertical().show_rows(
                     ui,
                     166.0,
@@ -586,33 +614,42 @@ impl PdfApp {
                             }
                             let selected = self.selected_pages.contains(&page) || self.page == page;
                             egui::Frame::new()
-                                .fill(if selected {
-                                    ui.visuals().selection.bg_fill
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(if selected {
+                                    egui::Stroke::new(2.0, crate::theme::accent(ui))
                                 } else {
-                                    egui::Color32::TRANSPARENT
+                                    egui::Stroke::NONE
                                 })
+                                .corner_radius(8.0)
                                 .inner_margin(6.0)
                                 .show(ui, |ui| {
                                     ui.set_min_height(150.0);
                                     ui.set_min_width(116.0);
-                                    if let Some(tex) = self.thumbnails.get(&page) {
-                                        let response = ui.add(
-                                            egui::Image::new((tex.id(), tex.size_vec2()))
-                                                .sense(egui::Sense::click()),
-                                        );
-                                        if response.clicked() {
-                                            if ui.input(|i| i.modifiers.command) {
-                                                if !self.selected_pages.insert(page) {
-                                                    self.selected_pages.remove(&page);
+                                    ui.vertical_centered(|ui| {
+                                        if let Some(tex) = self.thumbnails.get(&page) {
+                                            let response = ui.add(
+                                                egui::Image::new((tex.id(), tex.size_vec2()))
+                                                    .corner_radius(4.0)
+                                                    .sense(egui::Sense::click()),
+                                            );
+                                            if response.clicked() {
+                                                if ui.input(|i| i.modifiers.command) {
+                                                    if !self.selected_pages.insert(page) {
+                                                        self.selected_pages.remove(&page);
+                                                    }
+                                                } else {
+                                                    self.selected_pages.clear();
+                                                    self.selected_pages.insert(page);
                                                 }
-                                            } else {
-                                                self.selected_pages.clear();
-                                                self.selected_pages.insert(page);
+                                                self.go_to_page(page);
                                             }
-                                            self.go_to_page(page);
                                         }
-                                    }
-                                    ui.label(format!("{}", page + 1));
+                                        ui.label(
+                                            egui::RichText::new(format!("{}", page + 1))
+                                                .weak()
+                                                .size(11.0),
+                                        );
+                                    });
                                 });
                         }
                     },

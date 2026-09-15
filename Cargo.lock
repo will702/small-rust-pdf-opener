@@ -3628,6 +3628,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_extras",
+ "epaint",
  "image",
  "lopdf 0.34.0",
  "mupdf",

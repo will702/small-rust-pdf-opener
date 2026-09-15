@@ -167,6 +167,8 @@ pub struct PdfApp {
     placing_cert: bool,
     cert_place: Option<(egui::Pos2, egui::Pos2)>,
     cert_page: Option<usize>,
+    // Branding
+    logo: Option<egui::TextureHandle>,
     // Background work
     bg_tx: Sender<BackgroundMsg>,
     bg_rx: Receiver<BackgroundMsg>,
@@ -241,6 +243,7 @@ impl Default for PdfApp {
             placing_cert: false,
             cert_place: None,
             cert_page: None,
+            logo: None,
             bg_tx,
             bg_rx,
             busy: false,
@@ -251,11 +254,9 @@ impl Default for PdfApp {
 impl PdfApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
-        cc.egui_ctx.all_styles_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-            style.spacing.button_padding = egui::vec2(10.0, 6.0);
-        });
+        crate::theme::apply(&cc.egui_ctx);
         let mut app = Self::default();
+        app.logo = load_logo_texture(&cc.egui_ctx);
         app.recent = workspace::load_recent();
         if let Some(path) = initial {
             app.open_path(path);
@@ -685,18 +686,20 @@ impl PdfApp {
         if self.mode == ToolMode::VisualSign {
             egui::Panel::right("sign_panel")
                 .default_size(320.0)
+                .frame(crate::theme::chrome_frame(ui).inner_margin(egui::Margin::symmetric(12, 12)))
                 .show(ui, |ui| {
+                    crate::theme::hairline_left(ui);
                     ui.heading("Visual signature");
                     ui.label("Draw or import, place a preview, then apply.");
                     let (resp, painter) = ui.allocate_painter(
                         egui::vec2(ui.available_width().min(400.0), 150.0),
                         egui::Sense::click_and_drag(),
                     );
-                    painter.rect_filled(resp.rect, 4.0, egui::Color32::from_gray(245));
+                    painter.rect_filled(resp.rect, 6.0, egui::Color32::WHITE);
                     painter.rect_stroke(
                         resp.rect,
-                        4.0,
-                        egui::Stroke::new(1.0, egui::Color32::GRAY),
+                        6.0,
+                        crate::theme::hairline(ui),
                         egui::StrokeKind::Outside,
                     );
                     if let Some(pos) = resp.interact_pointer_pos() {
@@ -764,7 +767,7 @@ impl PdfApp {
                         if ui
                             .add_enabled(
                                 !self.sig_pad.is_empty() || self.imported_sig.is_some(),
-                                egui::Button::new("Place on page"),
+                                crate::theme::primary_button(ui, "Place on page"),
                             )
                             .clicked()
                         {
@@ -805,7 +808,10 @@ impl PdfApp {
                         area.y1 = area.y0 + h;
                         self.staged_sig = Some((page, area));
                         ui.label("Click elsewhere on the page to move the preview.");
-                        if ui.button("Apply signature").clicked() {
+                        if ui
+                            .add(crate::theme::primary_button(ui, "Apply signature"))
+                            .clicked()
+                        {
                             let (w, h, rgba) = self
                                 .imported_sig
                                 .clone()
@@ -832,7 +838,9 @@ impl PdfApp {
         if self.mode == ToolMode::CertSign {
             egui::Panel::right("cert_panel")
                 .default_size(320.0)
+                .frame(crate::theme::chrome_frame(ui).inner_margin(egui::Margin::symmetric(12, 12)))
                 .show(ui, |ui| {
+                    crate::theme::hairline_left(ui);
                     ui.heading("Certificate signature");
                     ui.label("Import a .p12 / .pfx file.");
                     if ui.button("Choose PKCS#12…").clicked() {
@@ -870,7 +878,7 @@ impl PdfApp {
                     if ui
                         .add_enabled(
                             self.cert_identity.is_some() && self.session.is_some(),
-                            egui::Button::new("Place & sign"),
+                            crate::theme::primary_button(ui, "Place & sign"),
                         )
                         .clicked()
                     {
@@ -896,12 +904,12 @@ impl PdfApp {
                     ] {
                         ui.radio_value(&mut self.compress_preset, preset, preset.label());
                     }
-                    ui.horizontal(|ui| {
-                        if ui.button("Cancel").clicked() {
-                            self.show_compress = false;
-                        }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add_enabled(self.session.is_some() && !self.busy, egui::Button::new("Compress & Save"))
+                            .add_enabled(
+                                self.session.is_some() && !self.busy,
+                                crate::theme::primary_button(ui, "Compress & Save"),
+                            )
                             .clicked()
                         {
                             if let Some(path) = rfd::FileDialog::new()
@@ -927,6 +935,9 @@ impl PdfApp {
                                 }
                             }
                         }
+                        if ui.button("Cancel").clicked() {
+                            self.show_compress = false;
+                        }
                     });
                 });
         }
@@ -941,9 +952,9 @@ impl PdfApp {
                         "Results embed an invisible searchable layer and show boxes + text on screen.",
                     );
                     if ocr::models_installed() {
-                        ui.colored_label(egui::Color32::DARK_GREEN, "Models installed");
+                        ui.colored_label(crate::theme::system_green(ui), "Models installed");
                     } else {
-                        ui.colored_label(egui::Color32::DARK_RED, "Models not installed");
+                        ui.colored_label(crate::theme::system_red(ui), "Models not installed");
                     }
                     ui.horizontal(|ui| {
                         if ui
@@ -1076,11 +1087,11 @@ impl PdfApp {
                                 self.merge_paths.remove(i);
                             }
                         });
-                    ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(
                                 !self.busy && self.merge_paths.len() >= 2,
-                                egui::Button::new("Save merged…"),
+                                crate::theme::primary_button(ui, "Save merged…"),
                             )
                             .clicked()
                         {
@@ -1106,11 +1117,11 @@ impl PdfApp {
                                 .desired_width(160.0),
                         );
                     });
-                    ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(
                                 !self.busy && self.session.is_some(),
-                                egui::Button::new("Split to files…"),
+                                crate::theme::primary_button(ui, "Split to files…"),
                             )
                             .clicked()
                         {
@@ -1140,11 +1151,11 @@ impl PdfApp {
                         &mut self.extract_open_after,
                         "Open extracted file in this window",
                     );
-                    ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(
                                 !self.busy && self.session.is_some(),
-                                egui::Button::new("Extract…"),
+                                crate::theme::primary_button(ui, "Extract…"),
                             )
                             .clicked()
                         {
@@ -1192,11 +1203,11 @@ impl PdfApp {
                                 .desired_width(160.0),
                         );
                     });
-                    ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(
                                 !self.busy && self.session.is_some(),
-                                egui::Button::new("Export…"),
+                                crate::theme::primary_button(ui, "Export…"),
                             )
                             .clicked()
                         {
@@ -1215,26 +1226,57 @@ impl PdfApp {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.label(&err);
-                    if ui.button("OK").clicked() {
-                        self.error = None;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(crate::theme::primary_button(ui, "OK")).clicked() {
+                            self.error = None;
+                        }
+                    });
                 });
         }
     }
 
     fn viewer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if self.session.is_none() {
-            ui.centered_and_justified(|ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    ui.heading("Your documents. Your workspace.");
-                    ui.label("Read, organize, annotate, and sign — all on your device.");
-                    ui.add_space(16.0);
-                    if ui.button("Open PDF…").clicked() {
-                        self.open_dialog();
-                    }
-                    ui.weak("or drop a PDF into this window");
-                    ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.add_space((ui.available_height() * 0.5 - 190.0).max(24.0));
+                if let Some(logo) = &self.logo {
+                    ui.add(
+                        egui::Image::new((logo.id(), logo.size_vec2()))
+                            .fit_to_exact_size(egui::vec2(112.0, 112.0))
+                            .corner_radius(25.0),
+                    );
+                    ui.add_space(20.0);
+                }
+                ui.heading("Your documents. Your workspace.");
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Read, organize, annotate, and sign — all on your device.")
+                        .weak()
+                        .size(14.0),
+                );
+                ui.add_space(18.0);
+                let open = egui::Button::new(
+                    egui::RichText::new("Open PDF…")
+                        .color(egui::Color32::WHITE)
+                        .size(14.0),
+                )
+                .fill(crate::theme::accent(ui))
+                .stroke(egui::Stroke::NONE)
+                .corner_radius(7.0)
+                .min_size(egui::vec2(96.0, 32.0));
+                if ui.add(open).clicked() {
+                    self.open_dialog();
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("or drop a PDF into this window")
+                        .weak()
+                        .size(12.0),
+                );
+                if !self.recent.is_empty() {
+                    ui.add_space(28.0);
+                    ui.label(egui::RichText::new("Recent").weak().size(11.0));
+                    ui.add_space(4.0);
                     for path in self.recent.clone() {
                         if ui
                             .button(path.file_name().unwrap_or_default().to_string_lossy())
@@ -1244,7 +1286,7 @@ impl PdfApp {
                             self.open_path(path);
                         }
                     }
-                });
+                }
             });
             return;
         }
@@ -1309,6 +1351,8 @@ impl PdfApp {
                             best_page = page_idx;
                         }
 
+                        // Soft shadow makes the page float over the viewer surface.
+                        painter.add(crate::theme::page_shadow(ui, rect));
                         if let Some(tex) = self.page_textures.get(&page_idx) {
                             painter.image(
                                 tex.id(),
@@ -1319,23 +1363,28 @@ impl PdfApp {
                                 ),
                                 egui::Color32::WHITE,
                             );
+                            painter.rect_stroke(
+                                rect,
+                                0.0,
+                                crate::theme::hairline(ui),
+                                egui::StrokeKind::Outside,
+                            );
                         } else {
-                            painter.rect_filled(rect, 0.0, egui::Color32::from_gray(230));
+                            painter.rect_filled(rect, 8.0, ui.visuals().faint_bg_color);
                             painter.text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
                                 format!("Page {}", page_idx + 1),
-                                egui::FontId::proportional(16.0),
-                                egui::Color32::DARK_GRAY,
+                                egui::FontId::proportional(13.0),
+                                crate::theme::secondary_text(ui),
+                            );
+                            painter.rect_stroke(
+                                rect,
+                                8.0,
+                                crate::theme::hairline(ui),
+                                egui::StrokeKind::Outside,
                             );
                         }
-
-                        painter.rect_stroke(
-                            rect,
-                            0.0,
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(180)),
-                            egui::StrokeKind::Outside,
-                        );
 
                         if self.show_search {
                             for (_, hit) in
@@ -1345,7 +1394,7 @@ impl PdfApp {
                                 painter.rect_filled(
                                     r,
                                     0.0,
-                                    egui::Color32::from_rgba_unmultiplied(255, 220, 0, 80),
+                                    egui::Color32::from_rgba_unmultiplied(255, 214, 10, 76),
                                 );
                             }
                         }
@@ -1364,7 +1413,7 @@ impl PdfApp {
                                 painter.rect_stroke(
                                     pdf_rect_to_screen(&area, zoom, rect),
                                     0.0,
-                                    egui::Stroke::new(1.0, egui::Color32::BLUE),
+                                    egui::Stroke::new(1.0, crate::theme::accent(ui)),
                                     egui::StrokeKind::Outside,
                                 );
                             }
@@ -1384,16 +1433,13 @@ impl PdfApp {
                                     painter.rect_stroke(
                                         box_rect,
                                         2.0,
-                                        egui::Stroke::new(
-                                            1.5,
-                                            egui::Color32::from_rgb(30, 120, 220),
-                                        ),
+                                        egui::Stroke::new(1.25, crate::theme::accent(ui)),
                                         egui::StrokeKind::Outside,
                                     );
                                     painter.rect_filled(
                                         box_rect,
                                         2.0,
-                                        egui::Color32::from_rgba_unmultiplied(30, 120, 220, 28),
+                                        egui::Color32::from_rgba_unmultiplied(10, 132, 255, 26),
                                     );
                                     let font_size = (line.height * zoom * 0.85).clamp(9.0, 22.0);
                                     painter.text(
@@ -1412,7 +1458,7 @@ impl PdfApp {
                                 painter.rect_filled(
                                     pdf_rect_to_screen(&area, zoom, rect),
                                     0.0,
-                                    egui::Color32::from_rgba_unmultiplied(50, 130, 230, 45),
+                                    egui::Color32::from_rgba_unmultiplied(0, 122, 255, 44),
                                 );
                             }
                         }
@@ -1499,10 +1545,7 @@ impl PdfApp {
                                         painter.rect_stroke(
                                             egui::Rect::from_two_pos(a, b),
                                             0.0,
-                                            egui::Stroke::new(
-                                                1.5,
-                                                egui::Color32::from_rgb(0, 120, 255),
-                                            ),
+                                            egui::Stroke::new(1.25, crate::theme::accent(ui)),
                                             egui::StrokeKind::Outside,
                                         );
                                     }
@@ -1548,10 +1591,7 @@ impl PdfApp {
                                         painter.rect_stroke(
                                             egui::Rect::from_two_pos(a, b),
                                             0.0,
-                                            egui::Stroke::new(
-                                                1.5,
-                                                egui::Color32::from_rgb(0, 160, 80),
-                                            ),
+                                            egui::Stroke::new(1.25, crate::theme::system_green(ui)),
                                             egui::StrokeKind::Outside,
                                         );
                                     }
@@ -2056,13 +2096,21 @@ impl PdfApp {
     /// Path to current document bytes on disk (writes a temp file when dirty / unsaved).
     fn materialize_session_path(&self) -> Result<tempfile::TempPath, String> {
         use std::io::Write;
-        let session = self.session.as_ref().ok_or_else(|| "No document open".to_string())?;
-        let bytes = session.write_bytes(CompressPreset::Balanced.write_options()).map_err(|e| e.to_string())?;
-        let mut file = tempfile::Builder::new().prefix("pdf-opener-export-").suffix(".pdf").tempfile().map_err(|e| e.to_string())?;
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| "No document open".to_string())?;
+        let bytes = session
+            .write_bytes(CompressPreset::Balanced.write_options())
+            .map_err(|e| e.to_string())?;
+        let mut file = tempfile::Builder::new()
+            .prefix("pdf-opener-export-")
+            .suffix(".pdf")
+            .tempfile()
+            .map_err(|e| e.to_string())?;
         file.write_all(&bytes).map_err(|e| e.to_string())?;
         Ok(file.into_temp_path())
     }
-
 }
 
 impl eframe::App for PdfApp {
@@ -2079,19 +2127,25 @@ impl eframe::App for PdfApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
 
-        egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        egui::Panel::top("toolbar")
+            .frame(crate::theme::chrome_frame(ui).inner_margin(egui::Margin::symmetric(12, 8)))
+            .show(ui, |ui| {
+                self.toolbar(ui);
+                crate::theme::hairline_bottom(ui);
+            });
+        egui::Panel::bottom("status")
+            .frame(crate::theme::chrome_frame(ui).inner_margin(egui::Margin::symmetric(12, 6)))
+            .show(ui, |ui| {
+                crate::theme::hairline_top(ui);
+                self.status_bar(ui);
+            });
         self.page_sidebar(ui, &ctx);
         self.side_panels(ui);
         self.editor_panel(ui);
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(if ctx.global_style().visuals.dark_mode {
-                        egui::Color32::from_rgb(28, 30, 34)
-                    } else {
-                        egui::Color32::from_rgb(229, 232, 237)
-                    })
+                    .fill(crate::theme::viewer_bg(ui))
                     .inner_margin(16.0),
             )
             .show(ui, |ui| self.viewer(ui, &ctx));
@@ -2103,6 +2157,20 @@ fn pdf_rect_to_screen(r: &PdfRect, zoom: f32, page_rect: egui::Rect) -> egui::Re
         page_rect.min + egui::vec2(r.x0, r.y0) * zoom,
         page_rect.min + egui::vec2(r.x1, r.y1) * zoom,
     )
+}
+
+/// App logo as a texture, shared by the toolbar mark and welcome screen.
+fn load_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let icon =
+        eframe::icon_data::from_png_bytes(include_bytes!("../assets/app-icon-256.png")).ok()?;
+    Some(ctx.load_texture(
+        "app-logo",
+        egui::ColorImage::from_rgba_unmultiplied(
+            [icon.width as usize, icon.height as usize],
+            &icon.rgba,
+        ),
+        egui::TextureOptions::default(),
+    ))
 }
 
 fn screen_rect_to_pdf(
